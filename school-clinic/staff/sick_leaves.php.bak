@@ -1,0 +1,246 @@
+<?php
+/**
+ * Staff — Manage sick leave requests from employees.
+ * View, approve, or reject sick leave notifications.
+ */
+require_once __DIR__ . '/../config/db.php';
+require_login(['staff']);
+
+$page_title = 'Sick Leave Requests';
+
+/* ---- Search + Filter ---- */
+$search = trim($_GET['q'] ?? '');
+$statusFilter = $_GET['status'] ?? 'all';
+
+// Handle filter apply via URL query params
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['apply_filter'])) {
+    // filter is handled by the status filter logic below
+}
+
+// Handle reset
+if (isset($_GET['reset'])) {
+    unset($_GET['q'], $_GET['status']);
+    redirect('staff/sick_leaves.php');
+}
+?>
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !validate_csrf_token($_POST['csrf_token'] ?? '')) {
+    set_flash('danger', 'Invalid request. Please try again.');
+    redirect('staff/sick_leaves.php');
+}
+
+// Handle review (approve/reject)
+if (($_POST['do'] ?? '') === 'review') {
+    $leaveId = (int)($_POST['leave_id'] ?? 0);
+    $status  = in_array($_POST['status'] ?? '', ['approved', 'rejected'], true) ? $_POST['status'] : '';
+    $note    = trim($_POST['review_note'] ?? '');
+
+    if ($leaveId > 0 && $status !== '') {
+        $pdo->prepare("UPDATE sick_leaves SET status = ?, reviewed_by = ?, review_note = ?, reviewed_at = NOW() WHERE id = ?")
+            ->execute([$status, (int)current_user()['id'], $note !== '' ? $note : null, $leaveId]);
+        fire_event('sick_leave.reviewed', ['leave_id' => $leaveId, 'review_note' => $note !== '' ? $note : null]);
+        set_flash('success', 'Sick leave request ' . $status . '.');
+    } else {
+        set_flash('danger', 'Invalid review action.');
+    }
+    redirect('staff/sick_leaves.php');
+}
+
+// Handle review (approve/reject)
+if (($_POST['do'] ?? '') === 'review') {
+    $params[] = "%$search%";
+}
+if (in_array($statusFilter, ['pending', 'approved', 'rejected'], true)) {
+    $where .= $where ? ' AND' : 'WHERE';
+    $where .= ' sl.status = ?';
+    $params[] = $statusFilter;
+}
+if ($search !== '') {
+    $where .= $where ? ' AND' : 'WHERE';
+    $where .= ' (CONCAT(p.first_name, \' \', p.last_name) LIKE ? OR p.user_id LIKE ?)';
+    $params[] = "%$search%";
+    $params[] = "%$search%";
+}
+
+$sql = "SELECT sl.*, CONCAT(p.first_name, ' ', p.last_name) AS employee_name,
+               ed.department, ed.position, ed.employee_no,
+               CONCAT(rp.first_name, ' ', rp.last_name) AS reviewer_name
+        FROM sick_leaves sl
+        LEFT JOIN profiles p ON p.user_id = sl.user_id
+        LEFT JOIN employee_details ed ON ed.user_id = sl.user_id
+        LEFT JOIN profiles rp ON rp.user_id = sl.reviewed_by
+        $where
+        ORDER BY sl.created_at DESC
+        LIMIT 100";
+$stmt = $pdo->prepare($sql);
+$stmt->execute($params);
+$leaves = $stmt->fetchAll();
+
+// Counts for summary cards
+$pendingCount = (int)$pdo->query("SELECT COUNT(*) FROM sick_leaves WHERE status = 'pending'")->fetchColumn();
+$approvedCount = (int)$pdo->query("SELECT COUNT(*) FROM sick_leaves WHERE status = 'approved'")->fetchColumn();
+$rejectedCount = (int)$pdo->query("SELECT COUNT(*) FROM sick_leaves WHERE status = 'rejected'")->fetchColumn();
+
+require __DIR__ . '/../includes/layout_dashboard_start.php';
+?>
+
+<div class="row g-3 mb-4">
+    <div class="col-md-4">
+        <div class="metric-card">
+            <div class="metric-icon icon-warning"><i class="bi bi-hourglass-split"></i></div>
+            <div class="metric-value"><?= $pendingCount ?></div>
+            <div class="metric-label">Pending Requests</div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="metric-card">
+            <div class="metric-icon icon-success"><i class="bi bi-check-circle"></i></div>
+            <div class="metric-value"><?= $approvedCount ?></div>
+            <div class="metric-label">Approved</div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="metric-card">
+            <div class="metric-icon icon-primary"><i class="bi bi-x-circle"></i></div>
+            <div class="metric-value"><?= $rejectedCount ?></div>
+            <div class="metric-label">Declined</div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-3">
+    <div class="col-12">
+        <div class="card mb-3">
+            <div class="card-body">
+                <div class="row g-2 align-items-end audit-toolbar mb-2">
+                    <div class="col">
+                        <label class="form-label">Search</label>
+                        <input type="search" name="q" class="form-control form-select form-select-sm" value="<?= e($search) ?>" placeholder="Name or employee ID..." aria-label="Search sick leaves">
+                        <label class="form-label">Filter</label>
+                        <form method="get" class="d-flex gap-2 align-items-center">
+                            <select name="status" class="form-select form-select-sm" onchange="this.form.submit()">
+                                <option value="all" <?= $statusFilter === 'all' ? 'selected' : '' ?>>All</option>
+                                <option value="pending" <?= $statusFilter === 'pending' ? 'selected' : '' ?>>Pending</option>
+                                <option value="approved" <?= $statusFilter === 'approved' ? 'selected' : '' ?>>Approved</option>
+                                <option value="rejected" <?= $statusFilter === 'rejected' ? 'selected' : '' ?>>Declined</option>
+                            </select>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="location.href='staff/sick_leaves.php?reset=1'">Reset</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="table-responsive">
+                <table class="table table-hover mb-0 align-middle">
+                    <thead>
+                        <tr>
+                            <th>Employee</th>
+                            <th>Department</th>
+                            <th>Reason</th>
+                            <th>Leave Period</th>
+                            <th>Filed</th>
+                            <th>Status</th>
+                            <th class="text-end">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (!$leaves): ?>
+                            <tr><td colspan="7" class="text-center text-muted py-4">No sick leave requests found.</td></tr>
+                        <?php else: foreach ($leaves as $leave): ?>
+                            <tr>
+                                <td>
+                                    <strong><?= e($leave['employee_name'] ?: '—') ?></strong><br>
+                                    <small class="text-muted"><?= e($leave['employee_no'] ?? '') ?></small>
+                                </td>
+                                <td><?= e($leave['department'] ?? '—') ?></td>
+                                <td><?= e(mb_strimwidth($leave['reason'], 0, 60, '…')) ?></td>
+                                <td>
+                                    <?= e(date('M d, Y', strtotime($leave['start_date']))) ?>
+                                    <?php if ($leave['end_date']): ?>
+                                        – <?= e(date('M d, Y', strtotime($leave['end_date']))) ?>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?= e(fmt_dt($leave['created_at'], 'M d, Y g:i A')) ?></td>
+                                <td>
+                                    <?php if ($leave['status'] === 'pending'): ?>
+                                        <span class="badge bg-warning text-dark">Pending</span>
+                                    <?php elseif ($leave['status'] === 'approved'): ?>
+                                        <span class="badge bg-success">Approved</span>
+                                    <?php else: ?>
+                                        <span class="badge bg-danger">Declined</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="text-end">
+                                    <?php if ($leave['status'] === 'pending'): ?>
+                                        <button class="btn btn-sm btn-success" data-bs-toggle="modal" data-bs-target="#approveModal<?= (int)$leave['id'] ?>"><i class="bi bi-check-lg"></i></button>
+                                        <button class="btn btn-sm btn-danger" data-bs-toggle="modal" data-bs-target="#rejectModal<?= (int)$leave['id'] ?>"><i class="bi bi-x-lg"></i></button>
+                                    <?php else: ?>
+                                        <span class="text-muted small">Reviewed by <?= e($leave['reviewer_name'] ?? '—') ?></span>
+                                        <?php if ($leave['review_note']): ?>
+                                            <br><small class="text-muted"><?= e($leave['review_note']) ?></small>
+                                        <?php endif; ?>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+
+                            <!-- Approve Modal -->
+                            <div class="modal fade" id="approveModal<?= (int)$leave['id'] ?>" tabindex="-1" aria-hidden="true">
+                                <div class="modal-dialog modal-dialog-centered modal-md">
+                                    <div class="modal-content">
+                                        <div class="card">
+                                            <div class="card-header">Approve Sick Leave</div>
+                                            <div class="card-body">
+                                                <p>Approve sick leave for <strong><?= e($leave['employee_name']) ?></strong>?</p>
+                                                <form method="post">
+                                                    <input type="hidden" name="csrf_token" value="<?= e(get_csrf_token()) ?>">
+                                                    <input type="hidden" name="do" value="review">
+                                                    <input type="hidden" name="leave_id" value="<?= (int)$leave['id'] ?>">
+                                                    <input type="hidden" name="status" value="approved">
+                                                    <div class="mb-3">
+                                                        <label class="form-label">Note (optional)</label>
+                                                        <textarea name="review_note" class="form-control" rows="2"></textarea>
+                                                    </div>
+                                                    <button type="submit" class="btn btn-success"><i class="bi bi-check-lg me-1"></i> Approve</button>
+                                                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                                                </form>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Reject Modal -->
+                            <div class="modal fade" id="rejectModal<?= (int)$leave['id'] ?>" tabindex="-1" aria-hidden="true">
+                                <div class="modal-dialog modal-dialog-centered modal-md">
+                                    <div class="modal-content">
+                                        <div class="card">
+                                            <div class="card-header">Reject Sick Leave</div>
+                                            <div class="card-body">
+                                                <p>Reject sick leave for <strong><?= e($leave['employee_name']) ?></strong>?</p>
+                                                <form method="post">
+                                                    <input type="hidden" name="csrf_token" value="<?= e(get_csrf_token()) ?>">
+                                                    <input type="hidden" name="do" value="review">
+                                                    <input type="hidden" name="leave_id" value="<?= (int)$leave['id'] ?>">
+                                                    <input type="hidden" name="status" value="rejected">
+                                                    <div class="mb-3">
+                                                        <label class="form-label">Reason for Rejection *</label>
+                                                        <textarea name="review_note" class="form-control" rows="2" required></textarea>
+                                                    </div>
+                                                    <button type="submit" class="btn btn-danger"><i class="bi bi-x-lg me-1"></i> Reject</button>
+                                                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                                                </form>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        <?php endforeach; endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php require __DIR__ . '/../includes/layout_dashboard_end.php'; ?>
